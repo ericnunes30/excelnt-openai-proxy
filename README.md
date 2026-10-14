@@ -15,7 +15,8 @@ O gateway `excelnt.ai` possui uma regra de proteção (WAF) que bloqueia chamada
 Este proxy local resolve esse problema de forma transparente:
 1. Você aponta seu cliente (Pencil, Cursor, etc.) para o proxy local (`http://127.0.0.1:5050/v1`).
 2. O proxy injeta automaticamente os cabeçalhos esperados pelo gateway (`User-Agent`, `Referer`, etc.).
-3. Repassa as requisições (com suporte completo a **Streaming SSE** e **Tool Calling**) e devolve as respostas com status **200 OK**.
+3. **Injeção de Idioma (PT-BR):** Injeta automaticamente uma regra no prompt de sistema forçando o modelo a responder SEMPRE em Português do Brasil no chat (mesmo que o Pencil ou Cursor enviem instruções nativas em inglês).
+4. Repassa as requisições (com suporte completo a **Streaming SSE** e **Tool Calling**) e devolve as respostas com status **200 OK**.
 
 ---
 
@@ -71,6 +72,20 @@ O terminal exibirá:
 ```
 
 O proxy agora estará escutando localmente na porta `5050`.
+
+### 🇧🇷 Personalizar ou Desativar a Regra de Idioma (PT-BR)
+Por padrão, o proxy garante que o modelo converse com você sempre em Português do Brasil (`Responda SEMPRE no chat em Português do Brasil (PT-BR) para o usuário.`).
+
+Caso queira desativar ou alterar a instrução padrão:
+```bash
+# Para desativar a injeção automática:
+set EXCELNT_SYSTEM_INSTRUCTION=""
+python proxy.py
+
+# Para definir uma instrução personalizada:
+set EXCELNT_SYSTEM_INSTRUCTION="Responda em tom técnico e sempre em PT-BR."
+python proxy.py
+```
 
 ---
 
