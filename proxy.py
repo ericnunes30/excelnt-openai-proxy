@@ -4,7 +4,26 @@ import urllib.error
 import json
 import os
 import sys
-from typing import Dict
+import time
+from typing import Dict, List, Optional, Tuple
+
+class EnvLoader:
+    @staticmethod
+    def load(env_filename: str = ".env"):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        paths = [os.path.join(script_dir, env_filename), os.path.join(os.getcwd(), env_filename)]
+        for p in paths:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        clean = line.strip()
+                        if clean and not clean.startswith("#") and "=" in clean:
+                            key, val = clean.split("=", 1)
+                            key = key.strip()
+                            val = val.strip().strip("'\"")
+                            if key and key not in os.environ:
+                                os.environ[key] = val
+                break
 
 class HeaderDecorator:
     EXCLUDED = {'host', 'user-agent', 'content-length'}
@@ -15,6 +34,7 @@ class HeaderDecorator:
             if k.lower() not in self.EXCLUDED
         }
         forwarded['User-Agent'] = 'Excelnt/1.0.24'
+        forwarded['originator'] = 'excelnt'
         forwarded['HTTP-Referer'] = 'https://github.com/ExcelntVetGit/Excelnt-Excelnt'
         forwarded['X-Title'] = 'Excelnt'
         return forwarded
@@ -32,43 +52,111 @@ class UrlResolver:
 class SystemInstructionInjector:
     DEFAULT_INSTRUCTION = "Responda SEMPRE no chat em Português do Brasil (PT-BR) para o usuário."
 
-    def __init__(self, instruction: str = DEFAULT_INSTRUCTION):
-        self._instruction = os.environ.get("EXCELNT_SYSTEM_INSTRUCTION", instruction).strip()
+    def __init__(self):
+        self._instruction = os.environ.get("EXCELNT_SYSTEM_INSTRUCTION", self.DEFAULT_INSTRUCTION).strip()
 
-    def inject(self, raw_body: bytes) -> bytes:
-        if not raw_body or not self._instruction:
-            return raw_body
-        try:
-            data = json.loads(raw_body)
-            if not isinstance(data, dict) or "messages" not in data:
-                return raw_body
-            messages = data.get("messages", [])
-            if not isinstance(messages, list):
-                return raw_body
+    def inject(self, payload_dict: dict) -> dict:
+        if not self._instruction or "messages" not in payload_dict:
+            return payload_dict
+        messages = payload_dict.get("messages", [])
+        if not isinstance(messages, list):
+            return payload_dict
 
-            system_msg = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
-            if system_msg and isinstance(system_msg.get("content"), str):
-                system_msg["content"] += f"\n\n[Regra de Comunicação]: {self._instruction}"
-            else:
-                messages.insert(0, {"role": "system", "content": f"[Regra de Comunicação]: {self._instruction}"})
+        system_msg = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
+        if system_msg and isinstance(system_msg.get("content"), str):
+            system_msg["content"] += f"\n\n[Regra de Comunicação]: {self._instruction}"
+        else:
+            messages.insert(0, {"role": "system", "content": f"[Regra de Comunicação]: {self._instruction}"})
+        return payload_dict
 
-            return json.dumps(data, ensure_ascii=False).encode("utf-8")
-        except Exception:
-            return raw_body
+class ModelFallbackManager:
+    DEFAULT_FALLBACKS = [
+        "deepseek-v4.1-flash",
+        "mimo-v2.6-flash",
+        "mimo-v2.6-pro",
+        "glm-5.3-flash",
+        "ling-flash-3.1",
+        "mimo-v2.5",
+        "gemini-3.7-flash",
+        "claude-sonnet-4-6"
+    ]
+
+    def __init__(self):
+        env_raw = os.environ.get("EXCELNT_FALLBACK_MODELS", "")
+        if env_raw.strip():
+            self._models = [m.strip() for m in env_raw.split(",") if m.strip()]
+        else:
+            self._models = self.DEFAULT_FALLBACKS
+
+    def get_candidate_chain(self, primary_model: str) -> List[str]:
+        candidates = [primary_model] if primary_model else []
+        for m in self._models:
+            if m not in candidates:
+                candidates.append(m)
+        return candidates
 
 class UpstreamForwarder:
-    def __init__(self, decorator: HeaderDecorator, resolver: UrlResolver, injector: SystemInstructionInjector):
+    RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+    def __init__(self, decorator: HeaderDecorator, resolver: UrlResolver, 
+                 injector: SystemInstructionInjector, fallback_mgr: ModelFallbackManager):
         self._decorator = decorator
         self._resolver = resolver
         self._injector = injector
+        self._fallback_mgr = fallback_mgr
+        self._max_fallbacks = int(os.environ.get("EXCELNT_MAX_FALLBACKS", "5"))
 
-    def forward(self, method: str, path: str, headers: http.client.HTTPMessage, body: bytes):
+    def forward(self, method: str, path: str, headers: http.client.HTTPMessage, raw_body: bytes):
         target_url = self._resolver.resolve(path)
         out_headers = self._decorator.decorate(headers)
-        transformed_body = self._injector.inject(body) if body else body
-        if transformed_body and 'content-type' not in [k.lower() for k in out_headers]:
+        if raw_body and 'content-type' not in [k.lower() for k in out_headers]:
             out_headers['Content-Type'] = 'application/json'
-        return urllib.request.Request(target_url, data=transformed_body, headers=out_headers, method=method)
+
+        # Only apply fallback and instruction injection to chat/completions JSON bodies
+        if method == "POST" and "chat/completions" in path and raw_body:
+            return self._forward_with_fallback(target_url, out_headers, raw_body)
+        
+        req = urllib.request.Request(target_url, data=raw_body, headers=out_headers, method=method)
+        return urllib.request.urlopen(req, timeout=60)
+
+    def _forward_with_fallback(self, target_url: str, headers: Dict[str, str], raw_body: bytes):
+        try:
+            payload = json.loads(raw_body.decode('utf-8'))
+        except Exception:
+            req = urllib.request.Request(target_url, data=raw_body, headers=headers, method="POST")
+            return urllib.request.urlopen(req, timeout=60)
+
+        payload = self._injector.inject(payload)
+        original_model = payload.get("model", "")
+        candidates = self._fallback_mgr.get_candidate_chain(original_model)[:self._max_fallbacks + 1]
+
+        last_error = None
+        for idx, model in enumerate(candidates):
+            payload["model"] = model
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            req = urllib.request.Request(target_url, data=body_bytes, headers=headers, method="POST")
+            try:
+                if idx > 0:
+                    sys.stderr.write(f"[Proxy Fallback] Testando modelo alternativo: '{model}'...\n")
+                resp = urllib.request.urlopen(req, timeout=60)
+                if idx > 0:
+                    sys.stderr.write(f"[Proxy Fallback] Sucesso com o modelo '{model}'!\n")
+                return resp
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if e.code in self.RETRY_STATUSES and idx < len(candidates) - 1:
+                    sys.stderr.write(f"[Proxy Fallback] Modelo '{model}' falhou com HTTP {e.code}. Tentando proximo...\n")
+                    time.sleep(0.5)
+                    continue
+                raise e
+            except Exception as e:
+                last_error = e
+                if idx < len(candidates) - 1:
+                    sys.stderr.write(f"[Proxy Fallback] Erro na conexao com '{model}': {e}. Tentando proximo...\n")
+                    time.sleep(0.5)
+                    continue
+                raise e
+        raise last_error
 
 class ProxyStreamer:
     def __init__(self, wfile):
@@ -83,11 +171,7 @@ class ProxyStreamer:
             self._wfile.flush()
 
 class ExcelntProxyHandler(http.server.BaseHTTPRequestHandler):
-    forwarder = UpstreamForwarder(
-        HeaderDecorator(),
-        UrlResolver("https://excelnt.ai/v1"),
-        SystemInstructionInjector()
-    )
+    forwarder = None  # Initialized in run()
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -105,15 +189,14 @@ class ExcelntProxyHandler(http.server.BaseHTTPRequestHandler):
     def _handle(self, method: str):
         content_len = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_len) if content_len > 0 else None
-        req = self.forwarder.forward(method, self.path, self.headers, body)
         streamer = ProxyStreamer(self.wfile)
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                self.send_response(resp.status)
-                self._copy_headers(resp.headers)
-                self.end_headers()
-                streamer.pipe(resp)
+            resp = self.forwarder.forward(method, self.path, self.headers, body)
+            self.send_response(resp.status)
+            self._copy_headers(resp.headers)
+            self.end_headers()
+            streamer.pipe(resp)
         except urllib.error.HTTPError as e:
             self.send_response(e.code)
             self._copy_headers(e.headers)
@@ -137,14 +220,25 @@ class ExcelntProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         sys.stderr.write(f"[Proxy] {args[0]} {args[1]} -> {args[2]}\n")
 
-def run(port: int = 5050):
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', port), ExcelntProxyHandler)
-    print(f"==================================================")
+def run():
+    EnvLoader.load()
+    port = int(os.environ.get("EXCELNT_PORT", "5050"))
+    ExcelntProxyHandler.forwarder = UpstreamForwarder(
+        HeaderDecorator(),
+        UrlResolver("https://excelnt.ai/v1"),
+        SystemInstructionInjector(),
+        ModelFallbackManager()
+    )
+    fallback_mgr = ModelFallbackManager()
+    print("==================================================")
     print(f"   PROXY EXCELNT AI ATIVO EM: http://127.0.0.1:{port}/v1")
-    print(f"   [PT-BR Auto-Injetado nas mensagens do sistema]")
-    print(f"==================================================")
+    print(f"   [Fallback Automatico de Modelos: ATIVADO]")
+    print(f"   Modelos na fila: {', '.join(fallback_mgr._models)}")
+    print("==================================================")
     print(f"Configure o Base URL no Pencil/Cursor/etc como:")
     print(f"http://127.0.0.1:{port}/v1\n")
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', port), ExcelntProxyHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -16,7 +16,8 @@ Este proxy local resolve esse problema de forma transparente:
 1. Você aponta seu cliente (Pencil, Cursor, etc.) para o proxy local (`http://127.0.0.1:5050/v1`).
 2. O proxy injeta automaticamente os cabeçalhos esperados pelo gateway (`User-Agent`, `Referer`, etc.).
 3. **Injeção de Idioma (PT-BR):** Injeta automaticamente uma regra no prompt de sistema forçando o modelo a responder SEMPRE em Português do Brasil no chat (mesmo que o Pencil ou Cursor enviem instruções nativas em inglês).
-4. Repassa as requisições (com suporte completo a **Streaming SSE** e **Tool Calling**) e devolve as respostas com status **200 OK**.
+4. **Fallback Automático de Modelos:** Se o modelo solicitado estiver sob sobrecarga (erro 503, 504 ou 429), o proxy tenta automaticamente os próximos modelos configurados no seu `.env` sem travar seu agente.
+5. Repassa as requisições (com suporte completo a **Streaming SSE** e **Tool Calling**) e devolve as respostas com status **200 OK**.
 
 ---
 
@@ -73,18 +74,21 @@ O terminal exibirá:
 
 O proxy agora estará escutando localmente na porta `5050`.
 
-### 🇧🇷 Personalizar ou Desativar a Regra de Idioma (PT-BR)
-Por padrão, o proxy garante que o modelo converse com você sempre em Português do Brasil (`Responda SEMPRE no chat em Português do Brasil (PT-BR) para o usuário.`).
+### ⚙️ Configuração via `.env` (Fallback de Modelos e Idioma)
+Você pode criar ou editar o arquivo `.env` na mesma pasta do proxy (use o `.env.example` como base) para definir os modelos de contingência:
 
-Caso queira desativar ou alterar a instrução padrão:
-```bash
-# Para desativar a injeção automática:
-set EXCELNT_SYSTEM_INSTRUCTION=""
-python proxy.py
+```env
+# Modelos de fallback automático em ordem de prioridade
+EXCELNT_FALLBACK_MODELS=deepseek-v4.1-flash,mimo-v2.6-flash,mimo-v2.6-pro,glm-5.3-flash,ling-flash-3.1,mimo-v2.5,gemini-3.7-flash,claude-sonnet-4-6
 
-# Para definir uma instrução personalizada:
-set EXCELNT_SYSTEM_INSTRUCTION="Responda em tom técnico e sempre em PT-BR."
-python proxy.py
+# Regra injetada automaticamente para o modelo sempre responder em português:
+EXCELNT_SYSTEM_INSTRUCTION=Responda SEMPRE no chat em Português do Brasil (PT-BR) para o usuário.
+
+# Porta local do proxy
+EXCELNT_PORT=5050
+
+# Máximo de tentativas de fallback antes de repassar erro
+EXCELNT_MAX_FALLBACKS=5
 ```
 
 ---
